@@ -1,5 +1,3 @@
-# Drone_Flight_Anomaly_Detection
-
 
 # Drone Flight Anomaly Dashboard - Defense Analytics
 
