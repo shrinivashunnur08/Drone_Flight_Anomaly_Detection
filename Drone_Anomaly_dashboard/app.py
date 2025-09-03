@@ -4,6 +4,18 @@ import numpy as np
 import plotly.express as px
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import IsolationForest
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+import random
+
+# -------------------------------
+# Set seeds for reproducibility
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
 
 # -------------------------------
 # Page Config
@@ -62,13 +74,13 @@ if uploaded_files:
     # Sidebar Controls
     st.sidebar.header("⚙️ Filter & Configuration Panel")
     model_choice = st.sidebar.radio("Select Anomaly Detection Model to Display", ["Isolation Forest", "Bi-LSTM Autoencoder"])
-    timesteps = st.sidebar.slider("Timesteps (for LSTM)", 1, 10, 3)
+    timesteps = st.sidebar.slider("Timesteps (for LSTM)", 1, 20, 5)  # Increased max timesteps for better sequence learning
     threshold_factor = st.sidebar.slider("Threshold Multiplier (for LSTM)", 1.0, 3.0, 2.0, 0.1)
 
     st.sidebar.markdown("### Risk Levels")
-    risk_normal = st.sidebar.checkbox("Normal")
-    risk_medium = st.sidebar.checkbox("Medium")
-    risk_high = st.sidebar.checkbox("High")
+    risk_normal = st.sidebar.checkbox("Normal", value=True)
+    risk_medium = st.sidebar.checkbox("Medium", value=True)
+    risk_high = st.sidebar.checkbox("High", value=True)
     selected_risks = [r for r, flag in zip(["Normal","Medium","High"], [risk_normal, risk_medium, risk_high]) if flag]
 
     st.sidebar.markdown("### Parameter-specific Anomalies")
@@ -87,7 +99,8 @@ if uploaded_files:
     df.fillna(method='bfill', inplace=True)
     features = df.drop(columns=['timestamp'], errors='ignore')
     numeric_features = features.select_dtypes(include=np.number)
-    scaled_features = MinMaxScaler().fit_transform(numeric_features)
+    scaler = MinMaxScaler()
+    scaled_features = scaler.fit_transform(numeric_features)
 
     # Initialize anomaly columns
     df['Anomaly_IF'] = 0
@@ -95,43 +108,57 @@ if uploaded_files:
 
     # -------------------------------
     # Isolation Forest
-    clf = IsolationForest(contamination=0.05, random_state=42)
+    clf = IsolationForest(contamination=0.05, random_state=SEED)
     clf.fit(scaled_features)
     df['Anomaly_IF'] = (clf.predict(scaled_features) == -1).astype(int)
 
     # -------------------------------
     # Bi-LSTM Autoencoder
-    import tensorflow as tf
-    from tensorflow.keras.models import Model
-    from tensorflow.keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
-
+    # Adjust timesteps to be valid
     timesteps = min(timesteps, len(scaled_features)//2)
     if timesteps < 1:
         timesteps = 1
 
+    # Prepare sequences
     X_seq = []
     for i in range(len(scaled_features)-timesteps):
         X_seq.append(scaled_features[i:i+timesteps])
     X_seq = np.array(X_seq)
     n_features = X_seq.shape[2]
 
+    # Model architecture with dropout for regularization
     inputs = Input(shape=(timesteps, n_features))
-    encoded = LSTM(64, activation='relu', return_sequences=True)(inputs)
-    encoded = LSTM(32, activation='relu', return_sequences=False)(encoded)
+    encoded = LSTM(128, activation='relu', return_sequences=True)(inputs)
+    encoded = Dropout(0.2)(encoded)
+    encoded = LSTM(64, activation='relu', return_sequences=False)(encoded)
+    encoded = Dropout(0.2)(encoded)
     decoded = RepeatVector(timesteps)(encoded)
-    decoded = LSTM(32, activation='relu', return_sequences=True)(decoded)
     decoded = LSTM(64, activation='relu', return_sequences=True)(decoded)
+    decoded = Dropout(0.2)(decoded)
+    decoded = LSTM(128, activation='relu', return_sequences=True)(decoded)
     outputs = TimeDistributed(Dense(n_features))(decoded)
     model = Model(inputs, outputs)
     model.compile(optimizer='adam', loss='mse')
 
-    st.info("Training Bi-LSTM Autoencoder... ⏳")
-    model.fit(X_seq, X_seq, epochs=20, batch_size=2, verbose=0)
+    st.info("Training ... ⏳")
+    early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    history = model.fit(
+        X_seq, X_seq,
+        epochs=50,  # Increased epochs for better training
+        batch_size=16,  # Increased batch size for stability
+        validation_split=0.1,
+        callbacks=[early_stop],
+        verbose=0
+    )
     st.success("Training Complete ✅")
 
+    # Predict and calculate MSE
     X_pred = model.predict(X_seq)
     mse = np.mean(np.power(X_seq - X_pred, 2), axis=(1,2))
-    threshold = np.mean(mse) + threshold_factor * np.std(mse)
+
+    # Use percentile-based threshold for better anomaly detection
+    percentile = 95
+    threshold = np.percentile(mse, percentile)
     anomaly_indices = np.where(mse > threshold)[0] + timesteps
     df.loc[anomaly_indices, 'Anomaly_LSTM'] = 1
 
